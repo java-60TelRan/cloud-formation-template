@@ -66,8 +66,8 @@ Parameters:
 
   # Amazon Linux 2 to align with yum
   LatestAmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Type: AWS::EC2::Image::Id
+   
 
 Resources:
 
@@ -155,7 +155,7 @@ Resources:
   Ec2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow FastAPI from inside VPC (NLB -> instance)
+      GroupDescription: Allow FastAPI from inside VPC NLB to instance
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -178,11 +178,9 @@ Resources:
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref InstanceType
       IamInstanceProfile: !Ref Ec2InstanceProfile
-      NetworkInterfaces:
-        - DeviceIndex: "0"
-          SubnetId: !Ref PrivateSubnet
-          GroupSet: [!Ref Ec2SecurityGroup]
-          AssociatePublicIpAddress: false
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds: 
+        - !Ref Ec2SecurityGroup
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-fastapi"
@@ -255,7 +253,7 @@ Resources:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
       LoadBalancerArn: !Ref InternalNlb
-      Port: 80
+      Port: !Ref ContainerPort
       Protocol: TCP
       DefaultActions:
         - Type: forward
