@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DEFAULT VPC + existing PUBLIC subnet (no new public subnets).
+  Create ONE private subnet + ONE route table + NAT Gateway (in existing public subnet).
+  EC2 in private subnet (SSM-managed via NAT) runs FastAPI from an EXISTING ECR image (Docker).
+  API Gateway HTTP API -> VPC Link -> Internal NLB -> EC2.
+  Cognito JWT authorizer applies to all routes except /health (public).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: fastapi-private-api
+
+  # Existing networking (default VPC + one existing public subnet for NAT)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing default VPC ID (e.g., vpc-xxxx)
+
+  VpcCidr:
+    Type: String
+    Default: 172.31.0.0/16
+    Description: CIDR of the existing default VPC (used for SG rules)
+
+  PublicSubnetIdForNat:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing PUBLIC subnet ID in the default VPC (for NAT Gateway placement)
+
+  # New private subnet (single-AZ) created by this stack
+  PrivateSubnetCidr:
+    Type: String
+    Default: 172.31.200.0/24
+    Description: CIDR for the NEW private subnet to create in the default VPC
+
+  PrivateSubnetAz:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: AZ to place the new private subnet in (ideally match the selected public subnet AZ)
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type (no AllowedValues restriction)
+
+  # Existing Cognito (do NOT create pool/users)
+  ExistingUserPoolId:
+    Type: String
+    Description: Existing Cognito User Pool Id (e.g., eu-west-1_AbCdEf)
+
+  ExistingUserPoolClientId:
+    Type: String
+    Description: Existing Cognito App Client Id (JWT audience)
+
+  # ECR image already pushed
+  EcrImageUri:
+    Type: String
+    Description: Full ECR image URI with tag (e.g., 123456789012.dkr.ecr.eu-west-1.amazonaws.com/myrepo:latest)
+
+  ContainerPort:
+    Type: Number
+    Default: 8000
+    Description: Container port FastAPI listens on (and host port mapped to)
+
+  HealthPath:
+    Type: String
+    Default: /health
+    Description: Health check path
+
+  # Amazon Linux 2 to align with yum
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+
+  # ---------------------------
+  # Private subnet + routing (single subnet, single route table)
+  # ---------------------------
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      AvailabilityZone: !Ref PrivateSubnetAz
+      CidrBlock: !Ref PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-rt"
+
+  PrivateSubnetRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------
+  # NAT Gateway (in EXISTING public subnet)
+  # ---------------------------
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-nat-eip"
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetIdForNat
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-nat"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # ---------------------------
+  # EC2 IAM (SSM + ECR pull)
+  # ---------------------------
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ec2-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Ec2Role]
+
+  # ---------------------------
+  # EC2 Security Group (NLB has no SG; allow from VPC CIDR to host port)
+  # ---------------------------
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow FastAPI from inside VPC (NLB -> instance)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp: !Ref VpcCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-ec2-sg"
+
+  # ---------------------------
+  # EC2 instance (private subnet) runs Docker image from ECR
+  # ---------------------------
+  FastApiInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !Ref PrivateSubnet
+          GroupSet: [!Ref Ec2SecurityGroup]
+          AssociatePublicIpAddress: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-fastapi"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          # --- yum-based setup (Amazon Linux 2) ---
+          yum update -y
+          yum install -y docker awscli jq
+
+          systemctl enable docker
+          systemctl start docker
+
+          # Ensure ec2-user can run docker (useful for SSM sessions)
+          usermod -aG docker ec2-user || true
+
+          REGION="${AWS::Region}"
+          IMAGE_URI="${EcrImageUri}"
+
+          # ECR login + pull
+          aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+          docker pull "$IMAGE_URI"
+
+          # Replace running container (if any)
+          docker rm -f fastapi || true
+
+          # Run container (host port == container port)
+          docker run -d --restart=always --name fastapi -p "${ContainerPort}:${ContainerPort}" "$IMAGE_URI"
+
+          # Optional quick local check
+          curl -fsS "http://127.0.0.1:${ContainerPort}${HealthPath}" || true
+
+  # ---------------------------
+  # Internal NLB (single subnet) -> EC2
+  # ---------------------------
+  NlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Port: !Ref ContainerPort
+      Protocol: TCP
+      Targets:
+        - Id: !Ref FastApiInstance
+          Port: !Ref ContainerPort
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: !Ref ContainerPort
+      HealthCheckPath: !Ref HealthPath
+      Matcher:
+        HttpCode: "200"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  InternalNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-nlb"
+      Type: network
+      Scheme: internal
+      Subnets:
+        - !Ref PrivateSubnet
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: "false"
+
+  NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalNlb
+      Port: 80
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NlbTargetGroup
+
+  # ---------------------------
+  # API Gateway HTTP API -> VPC Link -> NLB, with existing Cognito authorizer
+  # ---------------------------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-http-api"
+      ProtocolType: HTTP
+
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub "${ProjectName}-vpclink"
+      SubnetIds:
+        - !Ref PrivateSubnet
+
+  NlbIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationMethod: ANY
+      IntegrationUri: !Ref NlbListener
+      PayloadFormatVersion: "1.0"
+      TimeoutInMillis: 29000
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: !Sub "${ProjectName}-cognito-jwt"
+      IdentitySource:
+        - "$request.header.Authorization"
+      JwtConfiguration:
+        Audience:
+          - !Ref ExistingUserPoolClientId
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${ExistingUserPoolId}"
+
+  # Public health route (no auth)
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: !Sub "GET ${HealthPath}"
+      Target: !Sub "integrations/${NlbIntegration}"
+      AuthorizationType: NONE
+
+  # Catch-all route (auth required)
+  ProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub "integrations/${NlbIntegration}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: prod
+      AutoDeploy: true
+
+Outputs:
+  ApiEndpoint:
+    Description: HTTP API endpoint (prod stage)
+    Value: !Sub "${HttpApi.ApiEndpoint}/prod"
+
+  HealthEndpoint:
+    Description: Public health endpoint (no auth)
+    Value: !Sub "${HttpApi.ApiEndpoint}/prod${HealthPath}"
+
+  NlbDnsName:
+    Description: Internal NLB DNS (resolves only inside the VPC)
+    Value: !GetAtt InternalNlb.DNSName
+
+  InstanceId:
+    Description: EC2 instance ID (private subnet, SSM-managed via NAT)
+    Value: !Ref FastApiInstance
+
+  PrivateSubnetId:
+    Description: Created private subnet id
+    Value: !Ref PrivateSubnet
