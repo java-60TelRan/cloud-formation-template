@@ -28,7 +28,7 @@ Parameters:
   # New private subnet (single-AZ) created by this stack
   PrivateSubnetCidr:
     Type: String
-    Default: 172.31.200.0/24
+    Default: 172.31.128.0/20
     Description: CIDR for the NEW private subnet to create in the default VPC
 
   PrivateSubnetAz:
@@ -48,7 +48,13 @@ Parameters:
   ExistingUserPoolClientId:
     Type: String
     Description: Existing Cognito App Client Id (JWT audience)
-
+  AdminUsername:
+    Type: String
+    Description: Existing Cognito username to attach to the admin group (must already exist in the user pool)
+  AdminGroupName:
+    Type: String
+    Default: admin
+    Description: Cognito group name to create/ensure and attach the user to
   # ECR image already pushed
   EcrImageUri:
     Type: String
@@ -68,7 +74,10 @@ Parameters:
   LatestAmiId:
     Type: AWS::EC2::Image::Id
    
-
+  OllamaModel:
+    Type: String
+    Default: phi3:mini
+    Description: Ollama model name to pull (e.g. phi3:mini, llama3.1, mistral)
 Resources:
 
   # ---------------------------
@@ -99,6 +108,24 @@ Resources:
       SubnetId: !Ref PrivateSubnet
       RouteTableId: !Ref PrivateRouteTable
 
+
+  # ---------------------------
+  # Cognito: create group + attach existing user
+  # ---------------------------
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref ExistingUserPoolId
+      GroupName: !Ref AdminGroupName
+      Description: Admin users
+
+  AdminUserToGroupAttachment:
+    Type: AWS::Cognito::UserPoolUserToGroupAttachment
+    DependsOn: AdminGroup
+    Properties:
+      UserPoolId: !Ref ExistingUserPoolId
+      GroupName: !Ref AdminGroupName
+      Username: !Ref AdminUsername
   # ---------------------------
   # NAT Gateway (in EXISTING public subnet)
   # ---------------------------
@@ -201,19 +228,31 @@ Resources:
 
           REGION="${AWS::Region}"
           IMAGE_URI="${EcrImageUri}"
-
+          
           # ECR login + pull
           aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
           docker pull "$IMAGE_URI"
 
-          # Replace running container (if any)
-          docker rm -f fastapi || true
+         
 
           # Run container (host port == container port)
-          docker run -d --restart=always --name fastapi -p "${ContainerPort}:${ContainerPort}" "$IMAGE_URI"
+          docker run -d --restart=always --name travel_info --network host -e LOGGER_LEVEL=DEBUG -p "${ContainerPort}:${ContainerPort}" "$IMAGE_URI"
 
-          # Optional quick local check
-          curl -fsS "http://127.0.0.1:${ContainerPort}${HealthPath}" || true
+          # --- install Ollama ---
+          curl -fsSL https://ollama.com/install.sh | sh
+
+          # enable and start Ollama service
+          systemctl enable ollama
+          systemctl start ollama
+
+          # wait until Ollama is ready
+          sleep 5
+
+          # pull model (from CloudFormation parameter)
+          ollama pull "${OllamaModel}"
+
+          
+
 
   # ---------------------------
   # Internal NLB (single subnet) -> EC2
@@ -286,7 +325,7 @@ Resources:
       IntegrationUri: !Ref NlbListener
       PayloadFormatVersion: "1.0"
       TimeoutInMillis: 29000
-
+      
   JwtAuthorizer:
     Type: AWS::ApiGatewayV2::Authorizer
     Properties:
@@ -323,17 +362,17 @@ Resources:
     Type: AWS::ApiGatewayV2::Stage
     Properties:
       ApiId: !Ref HttpApi
-      StageName: prod
+      StageName:  "$default"
       AutoDeploy: true
 
 Outputs:
   ApiEndpoint:
-    Description: HTTP API endpoint (prod stage)
-    Value: !Sub "${HttpApi.ApiEndpoint}/prod"
+    Description: HTTP API endpoint 
+    Value: !GetAtt HttpApi.ApiEndpoint
 
   HealthEndpoint:
     Description: Public health endpoint (no auth)
-    Value: !Sub "${HttpApi.ApiEndpoint}/prod${HealthPath}"
+    Value: !Sub "${HttpApi.ApiEndpoint}${HealthPath}"
 
   NlbDnsName:
     Description: Internal NLB DNS (resolves only inside the VPC)
@@ -346,3 +385,11 @@ Outputs:
   PrivateSubnetId:
     Description: Created private subnet id
     Value: !Ref PrivateSubnet
+
+  AdminGroupCreated:
+    Description: Cognito group name created/ensured
+    Value: !Ref AdminGroupName
+
+  AdminUserAttached:
+    Description: Username attached to admin group
+    Value: !Ref AdminUsername
