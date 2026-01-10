@@ -236,7 +236,7 @@ Resources:
          
 
           # Run container (host port == container port)
-          docker run -d --restart=always --name travel_info --network host -e LOGGER_LEVEL=DEBUG -p "${ContainerPort}:${ContainerPort}" "$IMAGE_URI"
+          docker run -d --restart=always --name travel_info --network host -e LOGGER_LEVEL=DEBUG -e OLLAMA_MODEL_NAME=phi3:mini "$IMAGE_URI"
 
           # --- install Ollama ---
           curl -fsSL https://ollama.com/install.sh | sh
@@ -246,10 +246,10 @@ Resources:
           systemctl start ollama
 
           # wait until Ollama is ready
-          sleep 5
+          sleep 10
 
-          # pull model (from CloudFormation parameter)
-          ollama pull "${OllamaModel}"
+          # pull model 
+          ollama pull phi3:mini
 
           
 

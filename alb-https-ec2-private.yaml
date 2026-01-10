@@ -1,0 +1,325 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Default/existing VPC + existing PUBLIC subnets (no new public subnets).
+  Creates ONE private subnet + ONE route table + NAT Gateway (in an existing public subnet) for outbound internet
+  (SSM, yum, ECR pulls).
+  ALB (internet-facing) terminates HTTPS (ACM) and forwards to EC2 (private subnet) running FastAPI in Docker
+  from an existing ECR image.
+  No Cognito / no API Gateway. JWT validation is done inside FastAPI using Authorization: Bearer <JWT>.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: fastapi-alb-private
+
+  # Existing default VPC
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC ID (default VPC is fine)
+
+  # Existing public subnets for ALB (recommended: at least 2 in different AZs)
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Existing PUBLIC subnet IDs for the ALB (min 2 recommended)
+
+  # Existing public subnet to place NAT Gateway
+  PublicSubnetIdForNat:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing PUBLIC subnet ID for the NAT Gateway
+
+  # Create ONE private subnet
+  PrivateSubnetCidr:
+    Type: String
+    Default: 172.31.200.0/24
+    Description: CIDR for the NEW private subnet
+
+  PrivateSubnetAz:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: AZ for the NEW private subnet (ideally same AZ as PublicSubnetIdForNat)
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+  # App container
+  EcrImageUri:
+    Type: String
+    Description: Full ECR image URI with tag (e.g., 123456789012.dkr.ecr.il-central-1.amazonaws.com/repo:latest)
+
+  ContainerPort:
+    Type: Number
+    Default: 8000
+    Description: FastAPI container port (host port mapped to same)
+
+  HealthPath:
+    Type: String
+    Default: /travel/info/health
+    Description: Health check path served by FastAPI
+
+  # HTTPS
+  AcmCertificateArn:
+    Type: String
+    Description: ACM certificate ARN in the same region for ALB HTTPS listener
+
+  AlbIdleTimeoutSeconds:
+    Type: Number
+    Default: 120
+    Description: ALB idle timeout in seconds (increase if your requests are long-running)
+
+  LatestAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI id may be found in EC2 launch
+
+Resources:
+  # ---------------------------
+  # Networking: one private subnet + one route table + NAT
+  # ---------------------------
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      AvailabilityZone: !Ref PrivateSubnetAz
+      CidrBlock: !Ref PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-rt"
+
+  PrivateSubnetRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-nat-eip"
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetIdForNat
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-nat"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # ---------------------------
+  # IAM: SSM + ECR read
+  # ---------------------------
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ec2-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Ec2Role]
+
+  # ---------------------------
+  # Security Groups
+  # ---------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "ALB SG: inbound 80/443 from internet; egress all"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-alb-sg"
+
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "EC2 SG: allow app port only from ALB SG; egress all"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-ec2-sg"
+
+  # ---------------------------
+  # EC2 (private subnet): Docker + FastAPI image from ECR
+  # ---------------------------
+  FastApiInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref Ec2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-fastapi"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          yum update -y
+          yum install -y docker awscli jq
+
+          systemctl enable docker
+          systemctl start docker
+
+          usermod -aG docker ec2-user || true
+
+          REGION="${AWS::Region}"
+          IMAGE_URI="${EcrImageUri}"
+
+          # ECR login + pull
+          aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+          docker pull "$IMAGE_URI"
+
+          # Run container
+          docker run -d --restart=always --name travel_info --network host "$IMAGE_URI"
+          # --- install Ollama ---
+          curl -fsSL https://ollama.com/install.sh | sh
+
+          # enable and start Ollama service
+          systemctl enable ollama
+          systemctl start ollama
+
+          # wait until Ollama is ready
+          sleep 10
+
+          # pull model 
+          ollama pull phi3:mini
+
+          
+
+  # ---------------------------
+  # ALB (internet-facing) + Target Group
+  # ---------------------------
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: "false"
+        - Key: idle_timeout.timeout_seconds
+          Value: !Ref AlbIdleTimeoutSeconds
+
+  AlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      Targets:
+        - Id: !Ref FastApiInstance
+          Port: !Ref ContainerPort
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthPath
+      Matcher:
+        HttpCode: "200"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  # HTTP :80 -> redirect to HTTPS :443
+  AlbListenerHttp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+
+  # HTTPS :443 -> forward to EC2 target group (no Cognito / no auth at ALB level)
+  AlbListenerHttps:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref AcmCertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTargetGroup
+
+Outputs:
+  AlbDnsName:
+    Description: Public ALB DNS name (HTTPS enabled)
+    Value: !GetAtt Alb.DNSName
+
+  HttpsBaseUrl:
+    Description: Base HTTPS URL for clients use Authorization header
+    Value: !Sub "https://${Alb.DNSName}"
+
+  HealthUrl:
+    Description: Health endpoint URL
+    Value: !Sub "https://${Alb.DNSName}${HealthPath}"
+
+  InstanceId:
+    Description: EC2 instance ID (private subnet, SSM-managed via NAT)
+    Value: !Ref FastApiInstance
+
+  PrivateSubnetId:
+    Description: Created private subnet ID
+    Value: !Ref PrivateSubnet
