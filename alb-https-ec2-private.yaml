@@ -55,6 +55,9 @@ Parameters:
     Type: String
     Default: /travel/info/health
     Description: Health check path served by FastAPI
+  HostedZoneId:
+    Type: String
+    Description: Route53 Hosted Zone ID for tel-ran.org (e.g. Z123456ABCDEFG)  
 
   # HTTPS
   AcmCertificateArn:
@@ -66,10 +69,14 @@ Parameters:
     Default: 120
     Description: ALB idle timeout in seconds (increase if your requests are long-running)
 
-  LatestAmiId:
+  AmiId:
     Type: AWS::EC2::Image::Id
+    Default: ami-0e233d6c0a45f64ec
     Description: AMI id may be found in EC2 launch
-
+  OllamaModel:
+    Type: String
+    Default: ph3i:mini
+    Description: Ollama model name like ph3i, ph3i:mini
 Resources:
   # ---------------------------
   # Networking: one private subnet + one route table + NAT
@@ -122,7 +129,27 @@ Resources:
       RouteTableId: !Ref PrivateRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !Ref NatGateway
+  RootARecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: tel-ran.org.
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Alb.DNSName
+        HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
 
+  RootAAAARecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: tel-ran.org.
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Alb.DNSName
+        HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
   # ---------------------------
   # IAM: SSM + ECR read
   # ---------------------------
@@ -193,7 +220,7 @@ Resources:
   FastApiInstance:
     Type: AWS::EC2::Instance
     Properties:
-      ImageId: !Ref LatestAmiId
+      ImageId: !Ref AmiId
       InstanceType: !Ref InstanceType
       IamInstanceProfile: !Ref Ec2InstanceProfile
       SubnetId: !Ref PrivateSubnet
@@ -223,7 +250,7 @@ Resources:
           docker pull "$IMAGE_URI"
 
           # Run container
-          docker run -d --restart=always --name travel_info --network host "$IMAGE_URI"
+          docker run --name travel_info -e LOGGER_LEVEL=DEBUG -e OLLAMA_MODEL_NAME="${OllamaModel}" --network host -d  "$IMAGE_URI"
           # --- install Ollama ---
           curl -fsSL https://ollama.com/install.sh | sh
 
@@ -231,11 +258,7 @@ Resources:
           systemctl enable ollama
           systemctl start ollama
 
-          # wait until Ollama is ready
-          sleep 10
-
-          # pull model 
-          ollama pull phi3:mini
+          
 
           
 
