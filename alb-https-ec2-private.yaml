@@ -8,6 +8,19 @@ Description: >
   No Cognito / no API Gateway. JWT validation is done inside FastAPI using Authorization: Bearer <JWT>.
 
 Parameters:
+  ExistingUserPoolClientId:
+    Type: String
+    Description: Existing Cognito App Client Id (JWT audience)
+  ExistingUserPoolId:
+    Type: String
+    Description: Existing Cognito User Pool Id (e.g., eu-west-1_AbCdEf)
+  AdminUsername:
+    Type: String
+    Description: Existing Cognito username to attach to the admin group (must already exist in the user pool)
+  AdminGroupName:
+    Type: String
+    Default: admin
+    Description: Cognito group name to create/ensure and attach the user to
   ProjectName:
     Type: String
     Default: fastapi-alb-private
@@ -75,9 +88,26 @@ Parameters:
     Description: AMI id may be found in EC2 launch
   OllamaModel:
     Type: String
-    Default: ph3i:mini
+    Default: phi3:mini
     Description: Ollama model name like ph3i, ph3i:mini
 Resources:
+  # ---------------------------
+  # Cognito: create group + attach existing user
+  # ---------------------------
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref ExistingUserPoolId
+      GroupName: !Ref AdminGroupName
+      Description: Admin users
+
+  AdminUserToGroupAttachment:
+    Type: AWS::Cognito::UserPoolUserToGroupAttachment
+    DependsOn: AdminGroup
+    Properties:
+      UserPoolId: !Ref ExistingUserPoolId
+      GroupName: !Ref AdminGroupName
+      Username: !Ref AdminUsername
   # ---------------------------
   # Networking: one private subnet + one route table + NAT
   # ---------------------------
@@ -250,7 +280,7 @@ Resources:
           docker pull "$IMAGE_URI"
 
           # Run container
-          docker run --name travel_info -e LOGGER_LEVEL=DEBUG -e OLLAMA_MODEL_NAME="${OllamaModel}" --network host -d  "$IMAGE_URI"
+          docker run --name travel_info -e LOGGER_LEVEL=DEBUG -e OLLAMA_MODEL_NAME="${OllamaModel}" -e REGION="$REGION" -e USER_POOL_ID="${ExistingUserPoolId}" -e APP_CLIENT_ID="${ExistingUserPoolClientId}" --network host -d  "$IMAGE_URI"
           # --- install Ollama ---
           curl -fsSL https://ollama.com/install.sh | sh
 
