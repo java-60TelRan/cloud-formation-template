@@ -259,6 +259,12 @@ Resources:
         MetadataOptions:
           HttpTokens: required
         ImageId: !Ref AmiId
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              DeleteOnTermination: true
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
@@ -275,17 +281,33 @@ Resources:
             dnf -y upgrade amazon-ssm-agent || true
             systemctl restart amazon-ssm-agent || true
 
-            # Docker + jq
-            dnf -y install docker jq || true
+            # Docker 
+            dnf -y install docker  || true
             systemctl enable --now docker || true
-
+            export HOME=/root
             # Ollama install + start
             curl -fsSL https://ollama.com/install.sh | sh || true
             systemctl enable --now ollama || true
 
-            # Pull model (only if ollama is available)
-            if command -v ollama >/dev/null 2>&1; then
+            export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+
+            # Start ollama
+            systemctl enable --now ollama || true
+
+            # Wait until API responds (prevents race condition)
+            for i in $(seq 1 180); do
+              curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+              sleep 1
+            done
+
+            # Pull using absolute path (works even if PATH is weird)
+            if [ -x /usr/local/bin/ollama ]; then
+              /usr/local/bin/ollama pull "${OllamaModel}" || true
+            elif command -v ollama >/dev/null 2>&1; then
               ollama pull "${OllamaModel}" || true
+            else
+              echo "[WARN] ollama binary not found after install"
+              ls -la /usr/local/bin || true
             fi
 
             # ECR login + run FastAPI container
