@@ -1,0 +1,422 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Public ALB (HTTPS) -> Target Group -> ASG EC2 instances in ONE new private subnet.
+  Uses a shared LaunchTemplate to avoid duplicated instance config/user-data.
+  Each EC2 runs FastAPI (port 8000) from private ECR image and runs Ollama + pulls phi3:mini.
+  NAT Gateway provides ALL outbound access (SSM + ECR + Ollama install + model download).
+  Also creates Route53 A (Alias) record in tel-ran.org -> ALB.
+
+Parameters:
+  ExistingUserPoolClientId:
+    Type: String
+    Description: Existing Cognito App Client Id (JWT audience)
+
+  ExistingUserPoolId:
+    Type: String
+    Description: Existing Cognito User Pool Id (e.g., eu-west-1_AbCdEf)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Default VPC ID
+
+  AlbPublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnet IDs for ALB (choose 2+ in different AZs)
+
+  NatPublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: One PUBLIC subnet ID (in same VPC) to place the NAT Gateway
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 172.31.128.0/20
+    Description: CIDR for the NEW private subnet (must not overlap existing VPC subnets)
+
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN (for tel-ran.org or subdomain)
+
+  HostedZoneId:
+    Type: String
+    Description: Route53 Hosted Zone ID for tel-ran.org
+
+  RecordName:
+    Type: String
+    Default: tel-ran.org.
+    Description: DNS record (e.g., tel-ran.org. or api.tel-ran.org.)
+
+  EcrImageUri:
+    Type: String
+    Description: Full ECR image URI, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/myapp:latest
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+  AppPort:
+    Type: Number
+    Default: 8000
+
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-0e233d6c0a45f64ec
+    Description: AMI id may be found in EC2 launch
+
+  HealthCheckPath:
+    Type: String
+    Default: /health
+
+  AlbIdleTimeoutSeconds:
+    Type: Number
+    Default: 120
+    Description: ALB idle timeout in seconds (increase if your requests are long-running)
+
+  OllamaModel:
+    Type: String
+    Default: phi3:mini
+    Description: Ollama model name like phi3, phi3:mini
+
+  AsgMinSize:
+    Type: Number
+    Default: 2
+
+  AsgDesiredCapacity:
+    Type: Number
+    Default: 2
+
+  AsgMaxSize:
+    Type: Number
+    Default: 10
+
+Resources:
+  # ----------------------------
+  # Security Groups
+  # ----------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound HTTP/HTTPS to ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow FastAPI from ALB only; no SSH
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref AppPort
+          ToPort: !Ref AppPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # ----------------------------
+  # Networking: ONE private subnet + NAT
+  # ----------------------------
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-subnet"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-rt"
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref NatPublicSubnetId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat"
+
+  PrivateDefaultRouteToNat:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # ----------------------------
+  # IAM for EC2: SSM + ECR pull
+  # ----------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ----------------------------
+  # ALB + TG + Listeners
+  # ----------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: !Ref AlbPublicSubnets
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: "false"
+        - Key: idle_timeout.timeout_seconds
+          Value: !Ref AlbIdleTimeoutSeconds
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: !Ref AppPort
+      TargetType: instance
+
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      Matcher:
+        HttpCode: "200"
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  ListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+
+  ListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ----------------------------
+  # Launch Template (shared)
+  # ----------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-lt"
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        ImageId: !Ref AmiId
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+
+        # IMPORTANT for ASG: put profile here, not on instances.
+        IamInstanceProfile:
+          Name: !Ref InstanceProfile
+
+        MetadataOptions:
+          HttpTokens: required
+
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              DeleteOnTermination: true
+
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            exec > >(tee -a /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+            set -u
+
+            echo "[INFO] bootstrap start $(date -Is)"
+            dnf -y update || true
+
+            dnf -y upgrade amazon-ssm-agent || true
+            systemctl restart amazon-ssm-agent || true
+
+            dnf -y install docker || true
+            systemctl enable --now docker || true
+
+            export HOME=/root
+
+            curl -fsSL https://ollama.com/install.sh | sh || true
+            systemctl enable --now ollama || true
+
+            export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+
+            for i in $(seq 1 180); do
+              curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+              sleep 1
+            done
+
+            if [ -x /usr/local/bin/ollama ]; then
+              /usr/local/bin/ollama pull "${OllamaModel}" || true
+            elif command -v ollama >/dev/null 2>&1; then
+              ollama pull "${OllamaModel}" || true
+            else
+              echo "[WARN] ollama binary not found after install"
+              ls -la /usr/local/bin || true
+            fi
+
+            REGION="${AWS::Region}"
+            aws ecr get-login-password --region "$REGION" \
+              | docker login --username AWS --password-stdin "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com" || true
+
+            docker rm -f travel_info >/dev/null 2>&1 || true
+            docker run -d --restart unless-stopped \
+              --name travel_info \
+              --network host \
+              -e REGION="$REGION" \
+              -e OLLAMA_MODEL_NAME="${OllamaModel}" \
+              -e USER_POOL_ID="${ExistingUserPoolId}" \
+              -e APP_CLIENT_ID="${ExistingUserPoolClientId}" \
+              ${EcrImageUri} || true
+
+            echo "[INFO] bootstrap end $(date -Is)"
+
+  # ----------------------------
+  # ASG (replaces fixed Instance1/Instance2)
+  # ----------------------------
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [PrivateDefaultRouteToNat]
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet
+
+      MinSize: !Ref AsgMinSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      MaxSize: !Ref AsgMaxSize
+
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+
+      TargetGroupARNs:
+        - !Ref TargetGroup
+
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-asg-instance"
+          PropagateAtLaunch: true
+
+  # ----------------------------
+  # Scaling policy: 1 request/min per target
+  # (lint-safe ResourceLabel derived from ARNs)
+  # ----------------------------
+  RequestPerTargetScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 120
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Join
+            - "/"
+            -
+              - !Select
+                  - 1
+                  - !Split
+                    - "loadbalancer/"
+                    - !Select
+                      - 5
+                      - !Split [":", !Ref ApplicationLoadBalancer]
+              - !Select
+                  - 5
+                  - !Split [":", !Ref TargetGroup]
+        TargetValue: 1.0
+        DisableScaleIn: false
+
+  # ----------------------------
+  # Route53 Alias record -> ALB
+  # ----------------------------
+  AlbAliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref RecordName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+Outputs:
+  AlbDnsName:
+    Description: ALB DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  HttpsUrl:
+    Description: HTTPS URL via Route53 record
+    Value: !Sub "https://${RecordName}"
+
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnet
+
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
