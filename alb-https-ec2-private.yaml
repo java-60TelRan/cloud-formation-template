@@ -90,6 +90,10 @@ Parameters:
     Type: String
     Default: phi3:mini
     Description: Ollama model name like ph3i, ph3i:mini
+  CustomDomain:
+    Type: String
+    Default: tel-ran.org.
+    Description: Custom domain ending upwith dot  
 Resources:
   # ---------------------------
   # Cognito: create group + attach existing user
@@ -163,7 +167,7 @@ Resources:
     Type: AWS::Route53::RecordSet
     Properties:
       HostedZoneId: !Ref HostedZoneId
-      Name: tel-ran.org.
+      Name: !Ref CustomDomain
       Type: A
       AliasTarget:
         DNSName: !GetAtt Alb.DNSName
@@ -174,7 +178,7 @@ Resources:
     Type: AWS::Route53::RecordSet
     Properties:
       HostedZoneId: !Ref HostedZoneId
-      Name: tel-ran.org.
+      Name: !Ref CustomDomain
       Type: AAAA
       AliasTarget:
         DNSName: !GetAtt Alb.DNSName
