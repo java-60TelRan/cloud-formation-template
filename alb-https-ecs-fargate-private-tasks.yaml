@@ -8,10 +8,12 @@ Description: >
 Parameters:
   ExistingUserPoolClientId:
     Type: String
+    Default: 6n5mvgjg3rje55ek2dtkju0tmm
     Description: Existing Cognito App Client Id (JWT audience)
 
   ExistingUserPoolId:
     Type: String
+    Default: il-central-1_IKBrE7wfA
     Description: Existing Cognito User Pool Id (e.g., eu-west-1_AbCdEf)
 
   VpcId:
@@ -33,10 +35,12 @@ Parameters:
 
   CertificateArn:
     Type: String
+    Default: arn:aws:acm:il-central-1:436705618119:certificate/7ade2ddb-98c3-4aa8-84be-7a09b69c313d
     Description: ACM certificate ARN (for tel-ran.org or subdomain)
 
   HostedZoneId:
     Type: String
+    Default: Z0335357WOYG1YU6JXXM
     Description: Route53 Hosted Zone ID for tel-ran.org
 
   RecordName:
@@ -46,6 +50,7 @@ Parameters:
 
   EcrImageUri:
     Type: String
+    Default: 436705618119.dkr.ecr.il-central-1.amazonaws.com/fast-api-test
     Description: Full ECR image URI, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/myapp:latest
 
   AppPort:
@@ -317,6 +322,7 @@ Resources:
       ServiceName: !Sub "${AWS::StackName}-service"
       Cluster: !Ref EcsCluster
       LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
       DesiredCount: !Ref ServiceDesiredCount
       HealthCheckGracePeriodSeconds: 120
       NetworkConfiguration:
@@ -348,7 +354,7 @@ Resources:
     Properties:
       MaxCapacity: !Ref ServiceMaxCount
       MinCapacity: !Ref ServiceMinCount
-      ResourceId: !Sub "service/${EcsCluster}/${EcsService}"
+      ResourceId: !Sub "service/${EcsCluster}/${AWS::StackName}-service"
       ScalableDimension: ecs:service:DesiredCount
       ServiceNamespace: ecs
 
@@ -376,8 +382,8 @@ Resources:
               - !Select
                   - 5
                   - !Split [":", !Ref TargetGroup]
-        ScaleInCooldown: 120
-        ScaleOutCooldown: 60
+        ScaleInCooldown: 30
+        ScaleOutCooldown: 30
 
   # ----------------------------
   # Route53 Alias record -> ALB
